@@ -4,6 +4,21 @@ An Astro/Airflow onboarding project that tracks selected stock prices, calculate
 
 The project is designed for deployment to Astro. It uses Snowflake as durable storage and Alpha Vantage as the market data API.
 
+GitHub repository: https://github.com/vinnysgarzi-pixel/trading-onboarding-project
+
+## Current Astro Deployment
+
+A dedicated Astro deployment has been created for this project:
+
+- Deployment name: `trading-onboarding-project`
+- Deployment ID: `cmq5ovwx88pi801nvr18n2ysc`
+- Runtime: Astro Runtime `3.2-5` / Airflow `3.2.2`
+- Cloud/region: AWS `us-east-1`
+- Airflow dashboard: `https://cosmicenergy.astronomer.run/d18n2ysc`
+- Deployment dashboard: `https://cloud.astronomer.io/cmpx17yw51evb01n7rumg4h2p/deployments/cmq5ovwx88pi801nvr18n2ysc`
+
+Connection and variable setup is still pending.
+
 ## What The DAG Does
 
 `stock_sma_signals` runs on weekdays at:
@@ -115,13 +130,47 @@ astro dev parse
 
 ## Deploying To Astro
 
-Deploy this project to an Astro Deployment:
+Deploy this project to the dedicated Astro Deployment:
 
 ```bash
-astro deploy <deployment-id>
+astro deploy cmq5ovwx88pi801nvr18n2ysc
 ```
 
 Before triggering the DAG on Astro, configure the required Airflow connections and optional variables in the target deployment.
+
+Create the required connections with the Astro CLI when credentials are available:
+
+```bash
+astro deployment connection create \
+  --deployment-id cmq5ovwx88pi801nvr18n2ysc \
+  --conn-id stock_signal_snowflake \
+  --conn-type snowflake \
+  --login <snowflake_user> \
+  --password <snowflake_password> \
+  --schema <snowflake_schema> \
+  --extra '{"account":"<account>","database":"<database>","warehouse":"<warehouse>","role":"<role>"}'
+
+astro deployment connection create \
+  --deployment-id cmq5ovwx88pi801nvr18n2ysc \
+  --conn-id alpha_vantage_default \
+  --conn-type http \
+  --host https://www.alphavantage.co \
+  --password <alpha_vantage_api_key>
+```
+
+Optional variables can be set with:
+
+```bash
+astro deployment airflow-variable create \
+  --deployment-id cmq5ovwx88pi801nvr18n2ysc \
+  --key tracked_stock_tickers \
+  --value '["AAPL", "MSFT", "NVDA"]'
+
+astro deployment airflow-variable create \
+  --deployment-id cmq5ovwx88pi801nvr18n2ysc \
+  --key stock_alert_webhook_url \
+  --value '<webhook_url>'
+```
 
 ## Notes
 
