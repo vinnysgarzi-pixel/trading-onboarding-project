@@ -3,3 +3,4 @@
 apache-airflow-providers-snowflake>=6.12.1,<7
 astronomer-cosmos>=1.10,<2
 anthropic>=0.69
+apache-airflow-providers-smtp

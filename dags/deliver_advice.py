@@ -2,14 +2,21 @@
 # Deliver Advice
 
 Asset-triggered DAG: runs whenever the trade advisor writes a new batch to
-`stock_recommendations`. Formats the latest batch as a ranked leaderboard
-message and delivers it to the configured webhook (Slack-compatible payload).
-The message is always written to task logs, so the DAG works without a
-webhook configured.
+`stock_recommendations`. Delivers the ranked leaderboard through two
+independent channels, each skipping gracefully when unconfigured:
+
+- Slack-compatible webhook (Variable `stock_alert_webhook_url`)
+- HTML email (connection `smtp_default` + Variable
+  `stock_alert_email_recipients`, comma-separated addresses)
+
+The plain-text leaderboard is always written to task logs.
 
 Required Airflow configuration:
 - Snowflake connection: `stock_signal_snowflake`
+- Optional connection: `smtp_default` (host/port/login/password; Extra JSON
+  may set `from_email`)
 - Optional Variable: `stock_alert_webhook_url`
+- Optional Variable: `stock_alert_email_recipients`
 """
 
 from __future__ import annotations
@@ -21,9 +28,100 @@ import pendulum
 from airflow.sdk import Asset, Variable, dag, task
 
 SNOWFLAKE_CONN_ID = "stock_signal_snowflake"
+SMTP_CONN_ID = "smtp_default"
 RECOMMENDATIONS_ASSET = Asset(name="stock_recommendations")
 
 SIGNAL_EMOJI = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
+SIGNAL_COLOR = {"BUY": "#16a34a", "SELL": "#dc2626", "HOLD": "#6b7280"}
+SCORE_COLOR = {"BUY": "#dcfce7", "SELL": "#fee2e2", "HOLD": "#f3f4f6"}
+
+
+def _format_text_leaderboard(rows: list[dict]) -> str:
+    lines = [f"📈 *Trade Advisor* — signals as of {rows[0]['price_date']}"]
+    for rank, row in enumerate(rows, 1):
+        emoji = SIGNAL_EMOJI.get(row["signal"], "")
+        lines.append(
+            f"{rank}. {emoji} *{row['symbol']}* — {row['signal']} "
+            f"({row['score']:.0f}/100) at ${row['close']:.2f}\n   {row['rationale']}"
+        )
+    lines.append("_Demo signal pipeline on Astro — not investment advice._")
+    return "\n\n".join(lines)
+
+
+def _format_html_email(rows: list[dict]) -> str:
+    cards = []
+    for rank, row in enumerate(rows, 1):
+        signal = row["signal"]
+        badge = (
+            f'<span style="background:{SIGNAL_COLOR[signal]};color:#ffffff;'
+            'border-radius:12px;padding:2px 12px;font-size:13px;font-weight:600;">'
+            f"{signal}</span>"
+        )
+        cards.append(
+            f"""
+            <tr>
+              <td style="padding:14px 16px;background:{SCORE_COLOR[signal]};
+                         border-radius:10px;border:1px solid #e5e7eb;">
+                <table width="100%" cellpadding="0" cellspacing="0" style="font-family:Helvetica,Arial,sans-serif;">
+                  <tr>
+                    <td style="font-size:17px;font-weight:700;color:#111827;">
+                      {rank}. {row["symbol"]} &nbsp;{badge}
+                    </td>
+                    <td align="right" style="font-size:15px;color:#111827;">
+                      <strong>{row["score"]:.0f}</strong><span style="color:#6b7280;">/100</span>
+                      &nbsp;·&nbsp; ${row["close"]:.2f}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td colspan="2" style="padding-top:6px;font-size:13px;color:#374151;line-height:1.5;">
+                      {row["rationale"]}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td colspan="2" style="padding-top:6px;font-size:12px;color:#6b7280;">
+                      RSI {row["rsi_14"]:.0f} · MACD hist {row["macd_histogram"]:.2f} ·
+                      Bollinger z {row["bollinger_z"]:.2f} · Volume {row["volume_ratio"]:.2f}× ·
+                      News sentiment {row["sentiment_score"]:+.2f}
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr><td style="height:10px;"></td></tr>
+            """
+        )
+
+    return f"""
+    <html>
+      <body style="margin:0;padding:24px;background:#f9fafb;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr><td align="center">
+            <table width="560" cellpadding="0" cellspacing="0"
+                   style="font-family:Helvetica,Arial,sans-serif;">
+              <tr>
+                <td style="padding-bottom:4px;font-size:22px;font-weight:800;color:#111827;">
+                  📈 Trade Advisor
+                </td>
+              </tr>
+              <tr>
+                <td style="padding-bottom:18px;font-size:13px;color:#6b7280;">
+                  Signals as of {rows[0]["price_date"]} · powered by Apache Airflow on Astro
+                </td>
+              </tr>
+              {"".join(cards)}
+              <tr>
+                <td style="padding-top:12px;font-size:11px;color:#9ca3af;">
+                  Composite score blends trend (25%), MACD (20%), RSI (15%),
+                  Bollinger (15%), volume (5%), and AI-scored news sentiment (20%).
+                  BUY ≥ 65 · SELL ≤ 40. Demo signal pipeline — not investment advice.
+                </td>
+              </tr>
+            </table>
+          </td></tr>
+        </table>
+      </body>
+    </html>
+    """
 
 
 @dag(
@@ -38,12 +136,11 @@ SIGNAL_EMOJI = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
 )
 def deliver_advice():
     @task
-    def send_leaderboard() -> None:
-        import requests
+    def fetch_latest_batch() -> list[dict]:
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        rows = hook.get_records(
+        records = hook.get_records(
             """
             WITH latest_batch AS (
                 SELECT run_id
@@ -52,28 +149,41 @@ def deliver_advice():
                 LIMIT 1
             )
             SELECT
-                symbol, signal, score, close, price_date,
-                sentiment_summary, rationale
+                symbol, signal, score, close, price_date, rsi_14,
+                macd_histogram, bollinger_z, volume_ratio,
+                sentiment_score, sentiment_summary, rationale
             FROM stock_recommendations
             WHERE run_id = (SELECT run_id FROM latest_batch)
             ORDER BY score DESC
             """
         )
 
+        columns = [
+            "symbol", "signal", "score", "close", "price_date", "rsi_14",
+            "macd_histogram", "bollinger_z", "volume_ratio",
+            "sentiment_score", "sentiment_summary", "rationale",
+        ]
+        rows = []
+        for record in records:
+            row = dict(zip(columns, record))
+            row["price_date"] = str(row["price_date"])
+            for key in ("score", "close", "rsi_14", "macd_histogram",
+                        "bollinger_z", "volume_ratio", "sentiment_score"):
+                if row[key] is not None:
+                    row[key] = float(row[key])
+            rows.append(row)
+
         if not rows:
             print("No recommendations found; nothing to deliver")
-            return
+        return rows
 
-        as_of = rows[0][4]
-        lines = [f"📈 *Trade Advisor* — signals as of {as_of}"]
-        for rank, (symbol, signal, score, close, _, _, rationale) in enumerate(rows, 1):
-            emoji = SIGNAL_EMOJI.get(signal, "")
-            lines.append(
-                f"{rank}. {emoji} *{symbol}* — {signal} ({score:.0f}/100) at ${close:.2f}\n"
-                f"   {rationale}"
-            )
-        lines.append("_Demo signal pipeline on Astro — not investment advice._")
-        message = "\n\n".join(lines)
+    @task
+    def send_webhook(rows: list[dict]) -> None:
+        import requests
+
+        if not rows:
+            return
+        message = _format_text_leaderboard(rows)
 
         webhook_url = Variable.get("stock_alert_webhook_url", default=None)
         if webhook_url:
@@ -90,7 +200,47 @@ def deliver_advice():
 
         print(message)
 
-    send_leaderboard()
+    @task
+    def send_email(rows: list[dict]) -> None:
+        from airflow.sdk import BaseHook
+
+        if not rows:
+            return
+
+        recipients = Variable.get("stock_alert_email_recipients", default=None)
+        if not recipients:
+            print("Variable stock_alert_email_recipients not set; skipping email")
+            return
+        recipient_list = [address.strip() for address in recipients.split(",")]
+
+        try:
+            conn = BaseHook.get_connection(SMTP_CONN_ID)
+        except Exception:
+            print(f"Connection {SMTP_CONN_ID} not configured; skipping email")
+            return
+
+        from airflow.providers.smtp.hooks.smtp import SmtpHook
+
+        from_email = conn.extra_dejson.get("from_email") or conn.login
+        subject_date = rows[0]["price_date"]
+        top = rows[0]
+        subject = (
+            f"📈 Trade Advisor {subject_date}: "
+            f"{top['symbol']} {top['signal']} ({top['score']:.0f}/100)"
+        )
+
+        with SmtpHook(smtp_conn_id=SMTP_CONN_ID) as smtp:
+            smtp.send_email_smtp(
+                to=recipient_list,
+                from_email=from_email,
+                subject=subject,
+                html_content=_format_html_email(rows),
+            )
+        print(f"Leaderboard emailed to {recipient_list}")
+
+    rows = fetch_latest_batch()
+    send_webhook(rows)
+    send_email(rows)
 
 
 deliver_advice()
