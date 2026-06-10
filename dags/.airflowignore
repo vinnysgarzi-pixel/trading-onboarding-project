@@ -1,0 +1,3 @@
+# The dbt project is rendered by Cosmos from compute_indicators.py;
+# the scheduler should not scan it for DAG files.
+dbt/

@@ -1,0 +1,14 @@
+name: trading_indicators
+version: "1.0.0"
+profile: trading_indicators
+
+model-paths: ["models"]
+
+models:
+  trading_indicators:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table

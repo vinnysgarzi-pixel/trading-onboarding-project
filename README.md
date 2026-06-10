@@ -1,14 +1,17 @@
-# Trading Onboarding Project
+# Trading Onboarding Project — Trade Advisor
 
-An Astro/Airflow onboarding project that tracks selected stock prices, calculates 50-day and 200-day simple moving average signals, and emits alerts when a BUY or SELL crossover appears.
+An Astro/Airflow demo pipeline that ingests market data and news from Alpaca,
+computes technical indicators with dbt (via Astronomer Cosmos), blends them
+with Claude-scored news sentiment into a 0-100 conviction score per ticker,
+and delivers a ranked BUY/HOLD/SELL leaderboard with AI-written analyst
+rationales.
 
-The project is designed for deployment to Astro. It uses Snowflake as durable storage and Alpha Vantage as the market data API.
+> This is a signal pipeline demo for showcasing Astro orchestration patterns —
+> **not investment advice**. The strategy is intentionally swappable.
 
 GitHub repository: https://github.com/vinnysgarzi-pixel/trading-onboarding-project
 
 ## Current Astro Deployment
-
-A dedicated Astro deployment has been created for this project:
 
 - Deployment name: `trading-onboarding-project`
 - Deployment ID: `cmq5ovwx88pi801nvr18n2ysc`
@@ -17,128 +20,116 @@ A dedicated Astro deployment has been created for this project:
 - Airflow dashboard: `https://cosmicenergy.astronomer.run/d18n2ysc`
 - Deployment dashboard: `https://cloud.astronomer.io/cmpx17yw51evb01n7rumg4h2p/deployments/cmq5ovwx88pi801nvr18n2ysc`
 
-Connection and variable setup is still pending.
-
-## What The DAG Does
-
-`stock_sma_signals` runs on weekdays at:
-
-- `9:30 AM America/New_York`
-- `12:30 PM America/New_York`
-- `3:30 PM America/New_York`
-
-The workflow:
-
-1. Reads the configured ticker list.
-2. Creates Snowflake tables if needed.
-3. Fetches daily adjusted prices from Alpha Vantage for each ticker.
-4. Upserts price history into Snowflake.
-5. Calculates 50-day and 200-day simple moving averages.
-6. Detects BUY and SELL crossovers.
-7. Sends an optional webhook alert and records emitted signals in Snowflake to avoid duplicates.
-
-Default tickers are `AAPL`, `MSFT`, and `NVDA`.
+Connection and variable setup is still pending (see below).
 
 ## Architecture
 
+Four DAGs wired together with **Airflow Assets** (data-aware scheduling), so
+the lineage graph in the Astro UI shows the full pipeline:
+
 ```text
-stock_sma_signals
-    ├── get_ticker_config
-    ├── initialize_snowflake_tables
-    ├── fetch_and_store_price_history mapped per ticker
-    ├── calculate_sma_signals
-    └── send_alerts
+market_data_ingest  (cron: 9:30 / 12:30 / 3:30 ET weekdays)
+  ├── fetch_and_store_prices   (dynamic task mapping per ticker → Alpaca bars)
+  ├── fetch_and_store_news     (dynamic task mapping per ticker → Alpaca news)
+  └── emits Assets: snowflake://stock_prices, snowflake://stock_news
+          │
+          ▼ (asset-triggered)
+compute_indicators  (Cosmos DbtTaskGroup)
+  ├── dbt: stg_stock_prices
+  ├── dbt: int_sma_trend / int_rsi / int_macd / int_bollinger / int_volume
+  ├── dbt: stock_indicators mart (+ dbt tests)
+  └── emits Asset: snowflake://stock_indicators
+          │
+          ▼ (asset-triggered: indicators AND news)
+trade_advisor
+  ├── score_news_sentiment     (Claude reads headlines → -1..1 per ticker)
+  ├── compose_recommendations  (weighted composite score → BUY/HOLD/SELL,
+  │                             Claude writes per-ticker analyst rationale)
+  └── emits Asset: snowflake://stock_recommendations
+          │
+          ▼ (asset-triggered)
+deliver_advice
+  └── send_leaderboard         (ranked message → webhook + logs)
 ```
 
-Snowflake tables created by the DAG:
+### Composite score
 
-- `stock_prices`
-- `stock_signals`
+Each ticker gets a 0-100 conviction score: trend vs SMA50/200 (25%), MACD
+histogram and direction (20%), RSI-14 (15%), Bollinger z-score (15%), volume
+vs 20-day average (5%), and Claude-scored news sentiment (20%).
+BUY at >= 65, SELL at <= 40, otherwise HOLD. A ranking is produced on every
+run, so the demo always has fresh output.
+
+### Snowflake tables
+
+| Table | Written by |
+|---|---|
+| `stock_prices` | `market_data_ingest` |
+| `stock_news` | `market_data_ingest` |
+| `stock_indicators` (+ staging/intermediate views) | dbt via `compute_indicators` |
+| `stock_recommendations` | `trade_advisor` |
+
+### Graceful degradation
+
+If the `anthropic_default` connection is missing, the advisor still runs:
+sentiment defaults to neutral and rationales fall back to a template. The
+webhook variable is also optional — the leaderboard always lands in task logs.
 
 ## Required Airflow Connections
 
-### `stock_signal_snowflake`
+Configure these in the Astro **Environment Manager** (or `airflow_settings.yaml`
+for local dev — never commit secrets).
 
-Type: Snowflake
+### `stock_signal_snowflake` (Snowflake)
 
-Configure this connection with your Snowflake account details:
-
-- Login: Snowflake username
-- Password: Snowflake password or passphrase, depending on auth method
+- Login / Password: Snowflake user and password
 - Schema: target schema
-- Extra JSON: account, database, warehouse, role, and any other required Snowflake connection fields
+- Extra JSON: `{"account": "...", "database": "...", "warehouse": "...", "role": "..."}`
 
-Example Extra JSON shape:
+Cosmos builds the dbt profile from this same connection at runtime — no
+`profiles.yml` is needed.
 
-```json
-{
-  "account": "your_account",
-  "database": "your_database",
-  "warehouse": "your_warehouse",
-  "role": "your_role"
-}
-```
+### `alpaca_default` (HTTP)
 
-### `alpha_vantage_default`
+- Host: `https://data.alpaca.markets` (default if unset)
+- Login: Alpaca API key ID
+- Password: Alpaca API secret key
 
-Type: HTTP
+Free keys at https://alpaca.markets — market data and news API both work on
+unfunded paper accounts.
 
-Configure this connection with:
+### `anthropic_default` (Generic, optional)
 
-- Host: `https://www.alphavantage.co`
-- Password: your Alpha Vantage API key
-
-Alternatively, store the API key in Extra JSON:
-
-```json
-{
-  "api_key": "your_api_key"
-}
-```
+- Password: Anthropic API key (powers sentiment scoring and rationales,
+  model `claude-opus-4-8`)
 
 ## Optional Airflow Variables
 
-### `tracked_stock_tickers`
-
-JSON array of ticker symbols to track.
-
-Example:
-
-```json
-["AAPL", "MSFT", "NVDA"]
-```
-
-If this variable is not set, the DAG uses the default tickers in source code.
-
-### `stock_alert_webhook_url`
-
-Webhook URL for alert delivery. If this variable is not set, alerts are written to task logs only.
+| Variable | Purpose | Default |
+|---|---|---|
+| `tracked_stock_tickers` | JSON array, e.g. `["AAPL", "MSFT", "NVDA"]` | `["AAPL", "MSFT", "NVDA"]` |
+| `stock_alert_webhook_url` | Slack-compatible webhook for the leaderboard | logs only |
 
 ## Local Development
 
-Start Airflow locally:
-
 ```bash
-astro dev start
+astro dev start      # run Airflow locally
+astro dev parse      # parse-check all DAGs (includes the Cosmos dbt render)
+astro dev pytest     # run the DAG integrity tests in tests/
 ```
 
-Parse DAGs without starting Airflow:
+The dbt project lives at `dags/dbt/trading_indicators/` (inside `dags/` so
+DAG-only deploys ship dbt model changes too). The `Dockerfile` installs
+`dbt-snowflake` into an isolated `dbt_venv` that Cosmos invokes at runtime.
+
+## Deploying to Astro
 
 ```bash
-astro dev parse
+astro deploy cmq5ovwx88pi801nvr18n2ysc          # full image deploy (needed when Dockerfile/requirements change)
+astro deploy cmq5ovwx88pi801nvr18n2ysc --dags   # fast DAG-only deploy (DAGs + dbt models)
 ```
 
-## Deploying To Astro
-
-Deploy this project to the dedicated Astro Deployment:
-
-```bash
-astro deploy cmq5ovwx88pi801nvr18n2ysc
-```
-
-Before triggering the DAG on Astro, configure the required Airflow connections and optional variables in the target deployment.
-
-Create the required connections with the Astro CLI when credentials are available:
+Create the connections with the Astro CLI when credentials are available:
 
 ```bash
 astro deployment connection create \
@@ -152,15 +143,18 @@ astro deployment connection create \
 
 astro deployment connection create \
   --deployment-id cmq5ovwx88pi801nvr18n2ysc \
-  --conn-id alpha_vantage_default \
+  --conn-id alpaca_default \
   --conn-type http \
-  --host https://www.alphavantage.co \
-  --password <alpha_vantage_api_key>
-```
+  --host https://data.alpaca.markets \
+  --login <alpaca_api_key_id> \
+  --password <alpaca_api_secret_key>
 
-Optional variables can be set with:
+astro deployment connection create \
+  --deployment-id cmq5ovwx88pi801nvr18n2ysc \
+  --conn-id anthropic_default \
+  --conn-type generic \
+  --password <anthropic_api_key>
 
-```bash
 astro deployment airflow-variable create \
   --deployment-id cmq5ovwx88pi801nvr18n2ysc \
   --key tracked_stock_tickers \
@@ -172,9 +166,16 @@ astro deployment airflow-variable create \
   --value '<webhook_url>'
 ```
 
+After deploying, only `market_data_ingest` needs unpausing on a schedule — the
+other three DAGs are asset-triggered and fire automatically as data lands.
+
 ## Notes
 
-- This project is a scheduled analytics workflow, not a real-time trading system.
 - The schedule does not account for US market holidays.
-- Alpha Vantage free-tier limits may affect frequent runs or larger ticker lists.
-- The DAG records emitted signals in Snowflake so reruns do not resend the same BUY or SELL signal.
+- Alpaca's free tier uses the IEX feed (`feed=iex`); volumes are consolidated
+  differently than SIP but are fine for indicator demos.
+- Prices are fetched with `adjustment=all`, so stored closes are
+  split/dividend adjusted and indicator math is corporate-action safe.
+- The MACD model approximates EMAs with truncated exponentially-weighted
+  window sums (no recursive SQL); warm-up rows never reach the mart because
+  it keeps only rows with a full SMA-200 window.
