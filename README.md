@@ -100,8 +100,12 @@ unfunded paper accounts.
 
 ### `anthropic_default` (Generic, optional)
 
-- Password: Anthropic API key (powers sentiment scoring and rationales,
-  model `claude-opus-4-8`)
+Powers sentiment scoring and rationales (model `claude-opus-4-8`). Two shapes:
+
+- Direct Anthropic: leave Host empty, Password = Anthropic API key
+- Anthropic-compatible gateway (e.g. Astronomer's LLM gateway): Host = gateway
+  base URL (`https://api.astronomer.io/v1alpha1/organizations/<org_id>/llm`),
+  Password = Astro API token (sent as bearer auth)
 
 ## Optional Airflow Variables
 

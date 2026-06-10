@@ -53,7 +53,13 @@ SELL_THRESHOLD = 40
 
 
 def _get_anthropic_client():
-    """Return an Anthropic client, or None when no API key is configured."""
+    """Return an Anthropic client, or None when no API key is configured.
+
+    Two connection shapes are supported:
+    - password only: a regular Anthropic API key against api.anthropic.com
+    - host + password: an Anthropic-compatible gateway (e.g. Astronomer's
+      LLM gateway) where the password is a bearer token, not an API key
+    """
     try:
         conn = BaseHook.get_connection(ANTHROPIC_CONN_ID)
     except Exception:
@@ -63,6 +69,8 @@ def _get_anthropic_client():
 
     import anthropic
 
+    if conn.host:
+        return anthropic.Anthropic(base_url=conn.host, auth_token=conn.password)
     return anthropic.Anthropic(api_key=conn.password)
 
 
