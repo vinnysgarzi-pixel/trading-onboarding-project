@@ -38,7 +38,7 @@ SIGNAL_COLOR = {"BUY": "#16a34a", "SELL": "#dc2626", "HOLD": "#6b7280"}
 SCORE_COLOR = {"BUY": "#dcfce7", "SELL": "#fee2e2", "HOLD": "#f3f4f6"}
 
 
-def _format_text_leaderboard(rows: list[dict]) -> str:
+def _format_text_leaderboard(rows: list[dict], issues: list[dict]) -> str:
     lines = [f"📈 *Trade Advisor* — signals as of {rows[0]['price_date']}"]
     for rank, row in enumerate(rows, 1):
         emoji = SIGNAL_EMOJI.get(row["signal"], "")
@@ -46,11 +46,40 @@ def _format_text_leaderboard(rows: list[dict]) -> str:
             f"{rank}. {emoji} *{row['symbol']}* — {row['signal']} "
             f"({row['score']:.0f}/100) at ${row['close']:.2f}\n   {row['rationale']}"
         )
+    if issues:
+        issue_lines = "\n".join(
+            f"   • {issue['symbol']} ({issue['stage']}): {issue['error']}"
+            for issue in issues
+        )
+        lines.append(f"⚠️ *Data issues this run:*\n{issue_lines}")
     lines.append("_Demo signal pipeline on Astro — not investment advice._")
     return "\n\n".join(lines)
 
 
-def _format_html_email(rows: list[dict]) -> str:
+def _format_issues_card(issues: list[dict]) -> str:
+    if not issues:
+        return ""
+    items = "".join(
+        f"""<div style="padding-top:4px;">
+              <strong>{issue["symbol"]}</strong> ({issue["stage"]}): {issue["error"]}
+            </div>"""
+        for issue in issues
+    )
+    return f"""
+        <tr>
+          <td style="padding:14px 16px;background:#fef3c7;border:1px solid #f59e0b;
+                     border-radius:10px;font-family:Helvetica,Arial,sans-serif;
+                     font-size:13px;color:#92400e;line-height:1.5;">
+            <strong>⚠️ Data issues this run</strong> — these tickers could not be
+            refreshed and are missing or stale below:
+            {items}
+          </td>
+        </tr>
+        <tr><td style="height:10px;"></td></tr>
+    """
+
+
+def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
     cards = []
     for rank, row in enumerate(rows, 1):
         signal = row["signal"]
@@ -111,6 +140,7 @@ def _format_html_email(rows: list[dict]) -> str:
                 </td>
               </tr>
               {"".join(cards)}
+              {_format_issues_card(issues)}
               <tr>
                 <td style="padding-top:12px;font-size:11px;color:#9ca3af;">
                   Composite score blends trend (25%), MACD (20%), RSI (15%),
@@ -138,7 +168,7 @@ def _format_html_email(rows: list[dict]) -> str:
 )
 def deliver_advice():
     @task
-    def fetch_latest_batch() -> list[dict]:
+    def fetch_latest_batch() -> dict:
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
@@ -177,15 +207,37 @@ def deliver_advice():
 
         if not rows:
             print("No recommendations found; nothing to deliver")
-        return rows
+
+        # Ingest failures from the current cascade window, newest per
+        # symbol/stage, so bad tickers are surfaced rather than silently absent.
+        issue_records = hook.get_records(
+            """
+            SELECT symbol, stage, error
+            FROM ingest_issues
+            WHERE created_at >= DATEADD(hour, -4, CURRENT_TIMESTAMP())
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY symbol, stage ORDER BY created_at DESC
+            ) = 1
+            ORDER BY symbol, stage
+            """
+        )
+        issues = [
+            {"symbol": symbol, "stage": stage, "error": error}
+            for symbol, stage, error in issue_records
+        ]
+        if issues:
+            print(f"Surfacing {len(issues)} ingest issue(s) in this delivery")
+
+        return {"recommendations": rows, "issues": issues}
 
     @task
-    def send_webhook(rows: list[dict]) -> None:
+    def send_webhook(batch: dict) -> None:
         import requests
 
+        rows, issues = batch["recommendations"], batch["issues"]
         if not rows:
             return
-        message = _format_text_leaderboard(rows)
+        message = _format_text_leaderboard(rows, issues)
 
         webhook_url = Variable.get("stock_alert_webhook_url", default=None)
         if webhook_url:
@@ -203,9 +255,10 @@ def deliver_advice():
         print(message)
 
     @task
-    def render_email(rows: list[dict]) -> dict:
+    def render_email(batch: dict) -> dict:
         from airflow.sdk import BaseHook
 
+        rows, issues = batch["recommendations"], batch["issues"]
         if not rows:
             raise AirflowSkipException("No recommendations to email")
 
@@ -223,18 +276,21 @@ def deliver_advice():
             )
 
         top = rows[0]
+        subject = (
+            f"📈 Trade Advisor {top['price_date']}: "
+            f"{top['symbol']} {top['signal']} ({top['score']:.0f}/100)"
+        )
+        if issues:
+            subject += f" — ⚠️ {len(issues)} data issue(s)"
         return {
             "to": [address.strip() for address in recipients.split(",")],
-            "subject": (
-                f"📈 Trade Advisor {top['price_date']}: "
-                f"{top['symbol']} {top['signal']} ({top['score']:.0f}/100)"
-            ),
-            "html": _format_html_email(rows),
+            "subject": subject,
+            "html": _format_html_email(rows, issues),
         }
 
-    rows = fetch_latest_batch()
-    send_webhook(rows)
-    email_payload = render_email(rows)
+    batch = fetch_latest_batch()
+    send_webhook(batch)
+    email_payload = render_email(batch)
 
     # The sender address comes from the smtp_default connection's
     # Extra JSON `from_email`; skips cascade from render_email.
