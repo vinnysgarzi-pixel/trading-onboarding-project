@@ -25,6 +25,8 @@ import json
 from datetime import timedelta
 
 import pendulum
+from airflow.exceptions import AirflowSkipException
+from airflow.providers.smtp.operators.smtp import EmailOperator
 from airflow.sdk import Asset, Variable, dag, task
 
 SNOWFLAKE_CONN_ID = "stock_signal_snowflake"
@@ -201,46 +203,48 @@ def deliver_advice():
         print(message)
 
     @task
-    def send_email(rows: list[dict]) -> None:
+    def render_email(rows: list[dict]) -> dict:
         from airflow.sdk import BaseHook
 
         if not rows:
-            return
+            raise AirflowSkipException("No recommendations to email")
 
         recipients = Variable.get("stock_alert_email_recipients", default=None)
         if not recipients:
-            print("Variable stock_alert_email_recipients not set; skipping email")
-            return
-        recipient_list = [address.strip() for address in recipients.split(",")]
+            raise AirflowSkipException(
+                "Variable stock_alert_email_recipients not set; skipping email"
+            )
 
         try:
-            conn = BaseHook.get_connection(SMTP_CONN_ID)
+            BaseHook.get_connection(SMTP_CONN_ID)
         except Exception:
-            print(f"Connection {SMTP_CONN_ID} not configured; skipping email")
-            return
-
-        from airflow.providers.smtp.hooks.smtp import SmtpHook
-
-        from_email = conn.extra_dejson.get("from_email") or conn.login
-        subject_date = rows[0]["price_date"]
-        top = rows[0]
-        subject = (
-            f"📈 Trade Advisor {subject_date}: "
-            f"{top['symbol']} {top['signal']} ({top['score']:.0f}/100)"
-        )
-
-        with SmtpHook(smtp_conn_id=SMTP_CONN_ID) as smtp:
-            smtp.send_email_smtp(
-                to=recipient_list,
-                from_email=from_email,
-                subject=subject,
-                html_content=_format_html_email(rows),
+            raise AirflowSkipException(
+                f"Connection {SMTP_CONN_ID} not configured; skipping email"
             )
-        print(f"Leaderboard emailed to {recipient_list}")
+
+        top = rows[0]
+        return {
+            "to": [address.strip() for address in recipients.split(",")],
+            "subject": (
+                f"📈 Trade Advisor {top['price_date']}: "
+                f"{top['symbol']} {top['signal']} ({top['score']:.0f}/100)"
+            ),
+            "html": _format_html_email(rows),
+        }
 
     rows = fetch_latest_batch()
     send_webhook(rows)
-    send_email(rows)
+    email_payload = render_email(rows)
+
+    # The sender address comes from the smtp_default connection's
+    # Extra JSON `from_email`; skips cascade from render_email.
+    EmailOperator(
+        task_id="send_email",
+        conn_id=SMTP_CONN_ID,
+        to=email_payload["to"],
+        subject=email_payload["subject"],
+        html_content=email_payload["html"],
+    )
 
 
 deliver_advice()

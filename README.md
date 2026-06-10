@@ -107,12 +107,20 @@ Powers sentiment scoring and rationales (model `claude-opus-4-8`). Two shapes:
   base URL (`https://api.astronomer.io/v1alpha1/organizations/<org_id>/llm`),
   Password = Astro API token (sent as bearer auth)
 
+### `smtp_default` (SMTP, optional)
+
+Enables the HTML email report from `deliver_advice` (sent with the SMTP
+provider's `EmailOperator`). Host/port/login/password of any SMTP server
+(e.g. `smtp.gmail.com:587` with an app password), and set the sender in
+Extra JSON: `{"from_email": "you@example.com"}`.
+
 ## Optional Airflow Variables
 
 | Variable | Purpose | Default |
 |---|---|---|
 | `tracked_stock_tickers` | JSON array, e.g. `["AAPL", "MSFT", "NVDA"]` | `["AAPL", "MSFT", "NVDA"]` |
 | `stock_alert_webhook_url` | Slack-compatible webhook for the leaderboard | logs only |
+| `stock_alert_email_recipients` | Comma-separated email recipients | email skipped |
 
 ## Local Development
 
