@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from datetime import timedelta
+from pathlib import Path
 
 import pendulum
 from airflow.sdk import Asset, dag, task
@@ -31,7 +32,9 @@ from cosmos.profiles import SnowflakeUserPasswordProfileMapping
 
 SNOWFLAKE_CONN_ID = "stock_signal_snowflake"
 AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME", "/usr/local/airflow")
-DBT_PROJECT_PATH = f"{AIRFLOW_HOME}/dags/dbt/trading_indicators"
+# Resolve the dbt project relative to this file so the path works both
+# locally and inside Astro's versioned DAG-bundle extraction directories.
+DBT_PROJECT_PATH = str(Path(__file__).parent / "dbt" / "trading_indicators")
 DBT_EXECUTABLE_PATH = f"{AIRFLOW_HOME}/dbt_venv/bin/dbt"
 
 STOCK_PRICES_ASSET = Asset(name="stock_prices")
