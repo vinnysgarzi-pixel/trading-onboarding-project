@@ -29,7 +29,9 @@ ALPACA_CONN_ID = "alpaca_default"
 DEFAULT_TRACKED_TICKERS = ["AAPL", "MSFT", "NVDA"]
 PRICE_HISTORY_CALENDAR_DAYS = 500  # ~340 trading days; SMA-200 needs 200
 NEWS_LOOKBACK_DAYS = 5
-MIN_REQUIRED_BARS = 220
+# Tickers are scored on tiered indicator sets by available history (see
+# trade_advisor); ~20 trading days is the floor for the short-window tier.
+MIN_REQUIRED_BARS = 25
 
 STOCK_PRICES_ASSET = Asset(name="stock_prices")
 STOCK_NEWS_ASSET = Asset(name="stock_news")
@@ -166,8 +168,9 @@ def market_data_ingest():
 
         if len(bars) < MIN_REQUIRED_BARS:
             return symbol_failure(
-                f"only {len(bars)} daily bars returned; {MIN_REQUIRED_BARS} needed "
-                "for SMA-200 (unknown, delisted, or thinly traded symbol?)"
+                f"only {len(bars)} daily bars available; a ticker needs about a "
+                "month of trading history before it can be scored. It will join "
+                "the leaderboard automatically once it has enough data."
             )
 
         rows = [

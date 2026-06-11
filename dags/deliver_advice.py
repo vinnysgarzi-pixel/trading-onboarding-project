@@ -42,9 +42,16 @@ def _format_text_leaderboard(rows: list[dict], issues: list[dict]) -> str:
     lines = [f"📈 *Trade Advisor* — signals as of {rows[0]['price_date']}"]
     for rank, row in enumerate(rows, 1):
         emoji = SIGNAL_EMOJI.get(row["signal"], "")
+        tier = row.get("tier") or "full"
+        tier_note = ""
+        if tier == "new_ipo":
+            tier_note = f" 🆕 new listing ({row['history_days']:.0f} trading days)"
+        elif tier == "developing":
+            tier_note = f" ⏳ limited history ({row['history_days']:.0f} days)"
         lines.append(
             f"{rank}. {emoji} *{row['symbol']}* — {row['signal']} "
-            f"({row['score']:.0f}/100) at ${row['close']:.2f}\n   {row['rationale']}"
+            f"({row['score']:.0f}/100) at ${row['close']:.2f}{tier_note}\n"
+            f"   {row['rationale']}"
         )
     if issues:
         issue_lines = "\n".join(
@@ -79,6 +86,22 @@ def _format_issues_card(issues: list[dict]) -> str:
     """
 
 
+def _tier_badge_html(row: dict) -> str:
+    tier = row.get("tier") or "full"
+    if tier == "full":
+        return ""
+    days = int(row["history_days"]) if row.get("history_days") else 0
+    if tier == "new_ipo":
+        label, bg, fg = f"🆕 NEW LISTING · {days} trading days", "#ede9fe", "#6d28d9"
+    else:
+        label, bg, fg = f"⏳ {days} days of history — no SMA-200 yet", "#dbeafe", "#1d4ed8"
+    return (
+        f'&nbsp;<span style="background:{bg};color:{fg};border-radius:12px;'
+        'padding:2px 10px;font-size:11px;font-weight:600;white-space:nowrap;">'
+        f"{label}</span>"
+    )
+
+
 def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
     cards = []
     for rank, row in enumerate(rows, 1):
@@ -88,6 +111,7 @@ def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
             'border-radius:12px;padding:2px 12px;font-size:13px;font-weight:600;">'
             f"{signal}</span>"
         )
+        badge += _tier_badge_html(row)
         cards.append(
             f"""
             <tr>
@@ -112,6 +136,7 @@ def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
                     <td colspan="2" style="padding-top:6px;font-size:12px;color:#6b7280;">
                       RSI {row["rsi_14"]:.0f} · MACD hist {row["macd_histogram"]:.2f} ·
                       Bollinger z {row["bollinger_z"]:.2f} · Volume {row["volume_ratio"]:.2f}× ·
+                      Volatility {row["volatility_20"]:.0f}% ·
                       News sentiment {row["sentiment_score"]:+.2f}
                     </td>
                   </tr>
@@ -143,9 +168,11 @@ def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
               {_format_issues_card(issues)}
               <tr>
                 <td style="padding-top:12px;font-size:11px;color:#9ca3af;">
-                  Composite score blends trend (25%), MACD (20%), RSI (15%),
-                  Bollinger (15%), volume (5%), and AI-scored news sentiment (20%).
-                  BUY ≥ 65 · SELL ≤ 40. Demo signal pipeline — not investment advice.
+                  Composite score blends trend, MACD, RSI, Bollinger, volume,
+                  volatility, and AI-scored news sentiment, weighted by each
+                  ticker's history tier — newer listings lean on sentiment and
+                  volatility and need more conviction to leave HOLD (BUY ≥ 70
+                  vs 65). Demo signal pipeline — not investment advice.
                 </td>
               </tr>
             </table>
@@ -182,7 +209,8 @@ def deliver_advice():
             )
             SELECT
                 symbol, signal, score, close, price_date, rsi_14,
-                macd_histogram, bollinger_z, volume_ratio,
+                macd_histogram, bollinger_z, volume_ratio, volatility_20,
+                tier, history_days,
                 sentiment_score, sentiment_summary, rationale
             FROM stock_recommendations
             WHERE run_id = (SELECT run_id FROM latest_batch)
@@ -192,7 +220,8 @@ def deliver_advice():
 
         columns = [
             "symbol", "signal", "score", "close", "price_date", "rsi_14",
-            "macd_histogram", "bollinger_z", "volume_ratio",
+            "macd_histogram", "bollinger_z", "volume_ratio", "volatility_20",
+            "tier", "history_days",
             "sentiment_score", "sentiment_summary", "rationale",
         ]
         rows = []
@@ -200,9 +229,14 @@ def deliver_advice():
             row = dict(zip(columns, record))
             row["price_date"] = str(row["price_date"])
             for key in ("score", "close", "rsi_14", "macd_histogram",
-                        "bollinger_z", "volume_ratio", "sentiment_score"):
+                        "bollinger_z", "volume_ratio", "volatility_20",
+                        "history_days", "sentiment_score"):
                 if row[key] is not None:
                     row[key] = float(row[key])
+            # Batches written before tiering existed lack these fields.
+            row["tier"] = row["tier"] or "full"
+            row["history_days"] = row["history_days"] or 0.0
+            row["volatility_20"] = row["volatility_20"] if row["volatility_20"] is not None else 0.0
             rows.append(row)
 
         if not rows:

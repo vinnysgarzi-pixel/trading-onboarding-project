@@ -40,16 +40,49 @@ STOCK_INDICATORS_ASSET = Asset(name="stock_indicators")
 STOCK_NEWS_ASSET = Asset(name="stock_news")
 RECOMMENDATIONS_ASSET = Asset(name="stock_recommendations")
 
-SCORE_WEIGHTS = {
-    "trend": 0.25,
-    "macd": 0.20,
-    "rsi": 0.15,
-    "bollinger": 0.15,
-    "volume": 0.05,
-    "sentiment": 0.20,
+# Evaluation tiers keyed by available trading history. Young listings can't
+# support long-window indicators, so scoring shifts weight toward news
+# sentiment, short-window signals, and volatility risk — and the newest
+# tier demands more conviction before moving off HOLD.
+TIER_CONFIG = {
+    "full": {
+        "min_history": 200,
+        "label": "full history",
+        "weights": {
+            "trend": 0.25, "macd": 0.15, "rsi": 0.15, "bollinger": 0.10,
+            "volume": 0.05, "volatility": 0.10, "sentiment": 0.20,
+        },
+        "buy": 65,
+        "sell": 40,
+    },
+    "developing": {
+        "min_history": 60,
+        "label": "developing history — no SMA-200 yet",
+        "weights": {
+            "trend": 0.15, "macd": 0.15, "rsi": 0.15, "bollinger": 0.10,
+            "volume": 0.05, "volatility": 0.10, "sentiment": 0.30,
+        },
+        "buy": 65,
+        "sell": 40,
+    },
+    "new_ipo": {
+        "min_history": 20,
+        "label": "new listing",
+        "weights": {
+            "rsi": 0.15, "bollinger": 0.15, "volume": 0.10,
+            "volatility": 0.15, "sentiment": 0.45,
+        },
+        "buy": 70,  # thin data: demand more conviction in either direction
+        "sell": 35,
+    },
 }
-BUY_THRESHOLD = 65
-SELL_THRESHOLD = 40
+
+
+def _tier_for(history_days: float) -> str:
+    for tier_name in ("full", "developing", "new_ipo"):
+        if history_days >= TIER_CONFIG[tier_name]["min_history"]:
+            return tier_name
+    return "new_ipo"
 
 
 def _get_anthropic_client():
@@ -134,6 +167,18 @@ def _score_bollinger(z: float) -> float:
     return 15  # stretched above the band
 
 
+def _score_trend_short(latest: dict) -> tuple[float, str]:
+    """Trend read for tickers too young to have an SMA-200 anchor."""
+    close, sma_20, sma_50 = latest["close"], latest["sma_20"], latest["sma_50"]
+    if close > sma_20 > sma_50:
+        return 85, "short-term uptrend (close > SMA20 > SMA50)"
+    if close > sma_50:
+        return 70, "above SMA50"
+    if close > sma_20:
+        return 50, "above SMA20 but below SMA50"
+    return 25, "below short-term moving averages"
+
+
 def _score_volume(ratio: float) -> float:
     if ratio >= 2:
         return 90
@@ -142,6 +187,16 @@ def _score_volume(ratio: float) -> float:
     if ratio >= 0.75:
         return 50
     return 30
+
+
+def _score_volatility(annualized_pct: float) -> float:
+    if annualized_pct < 20:
+        return 70  # calm
+    if annualized_pct < 35:
+        return 60  # normal
+    if annualized_pct < 60:
+        return 40  # elevated
+    return 20  # speculative
 
 
 @dag(
@@ -174,12 +229,23 @@ def trade_advisor():
                 macd_histogram FLOAT,
                 bollinger_z FLOAT,
                 volume_ratio FLOAT,
+                volatility_20 FLOAT,
+                tier STRING,
+                history_days NUMBER,
                 sentiment_score FLOAT,
                 sentiment_summary STRING,
                 rationale STRING,
                 created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
             )
             """
+        )
+        # Upgrade tables created before tiering/volatility existed.
+        hook.run(
+            [
+                "ALTER TABLE stock_recommendations ADD COLUMN IF NOT EXISTS volatility_20 FLOAT",
+                "ALTER TABLE stock_recommendations ADD COLUMN IF NOT EXISTS tier STRING",
+                "ALTER TABLE stock_recommendations ADD COLUMN IF NOT EXISTS history_days NUMBER",
+            ]
         )
 
     @task
@@ -191,18 +257,18 @@ def trade_advisor():
             """
             WITH ranked AS (
                 SELECT
-                    symbol, price_date, close, sma_20, sma_50, sma_200,
-                    rsi_14, macd, macd_signal, macd_histogram,
-                    bollinger_z, volume_ratio,
+                    symbol, price_date, history_days, close, sma_20, sma_50,
+                    sma_200, rsi_14, macd, macd_signal, macd_histogram,
+                    bollinger_z, volume_ratio, volatility_20,
                     ROW_NUMBER() OVER (
                         PARTITION BY symbol ORDER BY price_date DESC
                     ) AS recency
                 FROM stock_indicators
             )
             SELECT
-                symbol, price_date, close, sma_20, sma_50, sma_200,
-                rsi_14, macd, macd_signal, macd_histogram,
-                bollinger_z, volume_ratio, recency
+                symbol, price_date, history_days, close, sma_20, sma_50,
+                sma_200, rsi_14, macd, macd_signal, macd_histogram,
+                bollinger_z, volume_ratio, volatility_20, recency
             FROM ranked
             WHERE recency <= 2
             ORDER BY symbol, recency
@@ -210,9 +276,9 @@ def trade_advisor():
         )
 
         columns = [
-            "symbol", "price_date", "close", "sma_20", "sma_50", "sma_200",
-            "rsi_14", "macd", "macd_signal", "macd_histogram",
-            "bollinger_z", "volume_ratio", "recency",
+            "symbol", "price_date", "history_days", "close", "sma_20", "sma_50",
+            "sma_200", "rsi_14", "macd", "macd_signal", "macd_histogram",
+            "bollinger_z", "volume_ratio", "volatility_20", "recency",
         ]
         snapshot: dict[str, list[dict]] = {}
         for row in rows:
@@ -352,21 +418,35 @@ def trade_advisor():
                 {"sentiment_score": 0.0, "summary": "No sentiment available."},
             )
 
-            trend_score, trend_state = _score_trend(latest)
-            subscores = {
-                "trend": trend_score,
-                "macd": _score_macd(latest, previous),
+            tier_name = _tier_for(latest["history_days"])
+            tier = TIER_CONFIG[tier_name]
+            weights = tier["weights"]
+
+            available = {
                 "rsi": _score_rsi(latest["rsi_14"]),
                 "bollinger": _score_bollinger(latest["bollinger_z"]),
                 "volume": _score_volume(latest["volume_ratio"]),
+                "volatility": _score_volatility(latest["volatility_20"]),
                 "sentiment": (symbol_sentiment["sentiment_score"] + 1) * 50,
             }
+            if tier_name == "full":
+                trend_score, trend_state = _score_trend(latest)
+                available["trend"] = trend_score
+            elif tier_name == "developing":
+                trend_score, trend_state = _score_trend_short(latest)
+                available["trend"] = trend_score
+            else:
+                trend_state = "not evaluated — insufficient history"
+            if "macd" in weights:
+                available["macd"] = _score_macd(latest, previous)
+
+            subscores = {name: available[name] for name in weights}
             composite = round(
-                sum(SCORE_WEIGHTS[name] * value for name, value in subscores.items())
+                sum(weight * subscores[name] for name, weight in weights.items())
             )
-            if composite >= BUY_THRESHOLD:
+            if composite >= tier["buy"]:
                 signal = "BUY"
-            elif composite <= SELL_THRESHOLD:
+            elif composite <= tier["sell"]:
                 signal = "SELL"
             else:
                 signal = "HOLD"
@@ -378,14 +458,20 @@ def trade_advisor():
                     "signal": signal,
                     "score": composite,
                     "close": round(latest["close"], 2),
+                    "tier": tier_name,
+                    "tier_label": tier["label"],
+                    "history_days": int(latest["history_days"]),
                     "trend_state": trend_state,
                     "rsi_14": latest["rsi_14"],
                     "macd_histogram": latest["macd_histogram"],
                     "bollinger_z": latest["bollinger_z"],
                     "volume_ratio": latest["volume_ratio"],
+                    "volatility_20": latest["volatility_20"],
                     "sentiment_score": symbol_sentiment["sentiment_score"],
                     "sentiment_summary": symbol_sentiment["summary"],
                     "subscores": subscores,
+                    "weights_used": weights,
+                    "thresholds": {"buy": tier["buy"], "sell": tier["sell"]},
                 }
             )
 
@@ -396,7 +482,8 @@ def trade_advisor():
         rationales = _generate_rationales(scorecards)
         for card in scorecards:
             card["rationale"] = rationales.get(card["symbol"]) or _template_rationale(card)
-            card.pop("subscores")
+            for transient in ("subscores", "weights_used", "thresholds"):
+                card.pop(transient)
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         with hook.get_conn() as conn:
@@ -406,9 +493,11 @@ def trade_advisor():
                     INSERT INTO stock_recommendations (
                         run_id, symbol, price_date, signal, score, close,
                         trend_state, rsi_14, macd_histogram, bollinger_z,
-                        volume_ratio, sentiment_score, sentiment_summary, rationale
+                        volume_ratio, volatility_20, tier, history_days,
+                        sentiment_score, sentiment_summary, rationale
                     ) VALUES (
-                        %s, %s, TO_DATE(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, TO_DATE(%s), %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s
                     )
                     """,
                     [
@@ -424,6 +513,9 @@ def trade_advisor():
                             card["macd_histogram"],
                             card["bollinger_z"],
                             card["volume_ratio"],
+                            card["volatility_20"],
+                            card["tier"],
+                            card["history_days"],
                             card["sentiment_score"],
                             card["sentiment_summary"],
                             card["rationale"],
@@ -475,12 +567,19 @@ def trade_advisor():
                     "For each ticker scorecard, write a 2-3 sentence rationale "
                     "explaining the signal in plain language, citing the most "
                     "decisive indicators by name and value. Match the tone of a "
-                    "morning desk note. Do not hedge with generic disclaimers."
+                    "morning desk note. Do not hedge with generic disclaimers. "
+                    "When a ticker's tier is 'new_ipo' or 'developing', open by "
+                    "noting it is a recently listed stock evaluated on limited "
+                    "history, with news sentiment and volatility weighted more "
+                    "heavily."
                 ),
                 user_content=(
                     "Write a rationale for each ticker. The composite score is "
-                    "0-100 (BUY >= 65, SELL <= 40) and blends: trend 25%, MACD "
-                    "20%, RSI 15%, Bollinger 15%, volume 5%, news sentiment 20%."
+                    "0-100. Each scorecard includes its evaluation tier, the "
+                    "exact weights_used, its BUY/SELL thresholds, and the "
+                    "subscores per signal — newer listings lack long-window "
+                    "indicators, so their weights lean on sentiment, "
+                    "short-window momentum, and volatility risk."
                     "\n\n" + json.dumps(scorecards, indent=2)
                 ),
                 schema=schema,
@@ -492,11 +591,20 @@ def trade_advisor():
         return {result["symbol"]: result["rationale"] for result in parsed["results"]}
 
     def _template_rationale(card: dict) -> str:
+        prefix = ""
+        if card["tier"] != "full":
+            prefix = (
+                f"Recently listed ({card['history_days']} trading days; "
+                f"{card['tier_label']}) — scored on a reduced indicator set with "
+                "sentiment and volatility weighted more heavily. "
+            )
         return (
-            f"{card['signal']} at {card['score']}/100. Trend: {card['trend_state']}; "
+            f"{prefix}{card['signal']} at {card['score']}/100. "
+            f"Trend: {card['trend_state']}; "
             f"RSI {card['rsi_14']:.0f}, MACD histogram {card['macd_histogram']:.2f}, "
             f"Bollinger z {card['bollinger_z']:.2f}, volume ratio "
-            f"{card['volume_ratio']:.2f}. News sentiment "
+            f"{card['volume_ratio']:.2f}, volatility {card['volatility_20']:.0f}% "
+            f"annualized. News sentiment "
             f"{card['sentiment_score']:+.2f}: {card['sentiment_summary']}"
         )
 

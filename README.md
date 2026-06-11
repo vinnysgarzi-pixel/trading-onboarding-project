@@ -52,13 +52,24 @@ deliver_advice
   └── send_leaderboard         (ranked message → webhook + logs)
 ```
 
-### Composite score
+### Composite score — tiered by available history
 
-Each ticker gets a 0-100 conviction score: trend vs SMA50/200 (25%), MACD
-histogram and direction (20%), RSI-14 (15%), Bollinger z-score (15%), volume
-vs 20-day average (5%), and Claude-scored news sentiment (20%).
-BUY at >= 65, SELL at <= 40, otherwise HOLD. A ranking is produced on every
-run, so the demo always has fresh output.
+Each ticker gets a 0-100 conviction score from seven signals: trend vs moving
+averages, MACD, RSI-14, Bollinger z-score, volume vs 20-day average, 20-day
+annualized realized volatility, and Claude-scored news sentiment. Because
+newly listed stocks can't support long-window indicators, the advisor picks
+an evaluation tier per ticker from its trading history:
+
+| Tier | History | trend | MACD | RSI | Boll | volume | volatility | sentiment | BUY / SELL |
+|---|---|---|---|---|---|---|---|---|---|
+| Full | ≥ 200 days | 25% (SMA-50/200) | 15% | 15% | 10% | 5% | 10% | 20% | ≥65 / ≤40 |
+| Developing | 60–199 days | 15% (SMA-20/50) | 15% | 15% | 10% | 5% | 10% | 30% | ≥65 / ≤40 |
+| New listing | 20–59 days | — | — | 15% | 15% | 10% | 15% | 45% | ≥70 / ≤35 |
+
+Tickers with under ~20 trading days are skipped with a note in the delivery
+(they join automatically once they have enough history). Non-full-tier
+tickers are badged in the email (🆕 NEW LISTING / ⏳ limited history). A
+ranking is produced on every run, so the demo always has fresh output.
 
 ### Snowflake tables
 
