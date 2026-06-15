@@ -1,10 +1,15 @@
 # Trading Onboarding Project — Trade Advisor
 
 An Astro/Airflow demo pipeline that ingests market data and news from Alpaca,
-computes technical indicators with dbt (via Astronomer Cosmos), blends them
-with Claude-scored news sentiment into a 0-100 conviction score per ticker,
-and delivers a ranked BUY/HOLD/SELL leaderboard with AI-written analyst
-rationales.
+computes technical indicators with dbt (via Astronomer Cosmos), and uses the
+**Apache Airflow Common AI provider** (`@task.llm`, `@task.llm_branch`) to score
+news sentiment, write analyst rationales, and route high-conviction calls
+through a **human-in-the-loop** approval gate — delivering a ranked
+BUY/HOLD/SELL leaderboard by email. A separate LLM-powered `failure_analyst`
+DAG triages pipeline failures, showcasing AI-driven observability on Astro.
+
+The LLM operators run against **Astronomer's LLM gateway** through a
+`pydanticai` connection — no model SDK or API key in the DAG code.
 
 > This is a signal pipeline demo for showcasing Astro orchestration patterns —
 > **not investment advice**. The strategy is intentionally swappable.
@@ -20,36 +25,43 @@ GitHub repository: https://github.com/vinnysgarzi-pixel/trading-onboarding-proje
 - Airflow dashboard: `https://cosmicenergy.astronomer.run/d18n2ysc`
 - Deployment dashboard: `https://cloud.astronomer.io/cmpx17yw51evb01n7rumg4h2p/deployments/cmq5ovwx88pi801nvr18n2ysc`
 
-Connection and variable setup is still pending (see below).
+Connections and variables are configured on the deployment (see below).
 
 ## Architecture
 
-Four DAGs wired together with **Airflow Assets** (data-aware scheduling), so
+Six DAGs wired together with **Airflow Assets** (data-aware scheduling), so
 the lineage graph in the Astro UI shows the full pipeline:
 
 ```text
 market_data_ingest  (cron: 9:30 / 12:30 / 3:30 ET weekdays)
   ├── fetch_and_store_prices   (dynamic task mapping per ticker → Alpaca bars)
   ├── fetch_and_store_news     (dynamic task mapping per ticker → Alpaca news)
-  └── emits Assets: snowflake://stock_prices, snowflake://stock_news
+  └── emits Assets: stock_prices, stock_news
           │
           ▼ (asset-triggered)
 compute_indicators  (Cosmos DbtTaskGroup)
   ├── dbt: stg_stock_prices
-  ├── dbt: int_sma_trend / int_rsi / int_macd / int_bollinger / int_volume
+  ├── dbt: int_sma_trend / int_rsi / int_macd / int_bollinger / int_volume / int_volatility
   ├── dbt: stock_indicators mart (+ dbt tests)
-  └── emits Asset: snowflake://stock_indicators
+  └── emits Asset: stock_indicators
           │
           ▼ (asset-triggered: indicators AND news)
-trade_advisor
-  ├── score_news_sentiment     (Claude reads headlines → -1..1 per ticker)
-  ├── compose_recommendations  (weighted composite score → BUY/HOLD/SELL,
-  │                             Claude writes per-ticker analyst rationale)
-  └── emits Asset: snowflake://stock_recommendations
-          │
-          ▼ (asset-triggered)
-deliver_advice
-  └── send_leaderboard         (ranked message → webhook + logs)
+trade_advisor   (Common AI provider operators)
+  ├── score_news_sentiment     @task.llm  → structured sentiment per ticker
+  ├── compute_scorecards       tiered composite score → BUY/HOLD/SELL
+  ├── generate_rationales      @task.llm  → analyst rationale per ticker
+  ├── persist_recommendations  → emits Asset: stock_recommendations
+  └── route_review             @task.llm_branch (risk officer) →
+                                 flag_for_review | clear_for_delivery
+          │                                    │
+          ▼ (asset-triggered)                  ▼ (flags high-conviction rows PENDING_REVIEW)
+deliver_advice                          trade_review   (on-demand, HITL)
+  └── send_webhook + EmailOperator        ├── fetch_pending_review
+     (+ code-native DeadlineAlert SLA)     ├── analyst_decision  HITLBranchOperator (Approve/Reject)
+                                           └── mark_approved | mark_rejected
+
+failure_analyst   (on-demand / Astro Dag-Failure alert via Dag Trigger)
+  └── extract_context → diagnose @task.llm (severity + root cause) → email on-call
 ```
 
 ### Composite score — tiered by available history
@@ -80,11 +92,14 @@ ranking is produced on every run, so the demo always has fresh output.
 | `stock_indicators` (+ staging/intermediate views) | dbt via `compute_indicators` |
 | `stock_recommendations` | `trade_advisor` |
 
-### Graceful degradation
+### LLM, review, and delivery
 
-If the `anthropic_default` connection is missing, the advisor still runs:
-sentiment defaults to neutral and rationales fall back to a template. The
-webhook variable is also optional — the leaderboard always lands in task logs.
+The `trade_advisor` LLM tasks require the `pydanticai_default` connection. The
+`trade_review` (HITL) DAG is on-demand — an analyst triggers it to approve the
+high-conviction signals the LLM branch flagged (`review_status = PENDING_REVIEW`),
+recording the decision back to `stock_recommendations`. Delivery is optional:
+without `smtp_default` / recipients the email step skips, and the leaderboard
+always lands in task logs.
 
 ## Required Airflow Connections
 
@@ -109,14 +124,19 @@ Cosmos builds the dbt profile from this same connection at runtime — no
 Free keys at https://alpaca.markets — market data and news API both work on
 unfunded paper accounts.
 
-### `anthropic_default` (Generic, optional)
+### `pydanticai_default` (Common AI provider)
 
-Powers sentiment scoring and rationales (model `claude-opus-4-8`). Two shapes:
+Powers the `@task.llm` / `@task.llm_branch` operators (model
+`anthropic:claude-opus-4-8`).
 
-- Direct Anthropic: leave Host empty, Password = Anthropic API key
-- Anthropic-compatible gateway (e.g. Astronomer's LLM gateway): Host = gateway
-  base URL (`https://api.astronomer.io/v1alpha1/organizations/<org_id>/llm`),
-  Password = Astro API token (sent as bearer auth)
+- Conn type: `pydanticai`
+- Host: LLM gateway base URL
+  (`https://api.astronomer.io/v1alpha1/organizations/<org_id>/llm`)
+- Password: Astro API token (the gateway accepts it as `x-api-key`)
+- Extra JSON: `{"model": "anthropic:claude-opus-4-8"}`
+
+Model and endpoint live entirely on the connection — the DAGs never import a
+model SDK. (The older `anthropic_default` connection is no longer used.)
 
 ### `smtp_default` (SMTP, optional)
 
@@ -132,6 +152,41 @@ Extra JSON: `{"from_email": "you@example.com"}`.
 | `tracked_stock_tickers` | JSON array, e.g. `["AAPL", "MSFT", "NVDA"]` | `["AAPL", "MSFT", "NVDA"]` |
 | `stock_alert_webhook_url` | Slack-compatible webhook for the leaderboard | logs only |
 | `stock_alert_email_recipients` | Comma-separated email recipients | email skipped |
+
+Edit `tracked_stock_tickers` in the Astro UI (**Environment → Airflow Variables**)
+to add/remove tickers — no redeploy needed; the next run picks it up. Keep the
+list under ~15 (the LLM sentiment/rationale calls are single batched requests).
+
+## Observability & SLAs
+
+The pipeline ships two reliability features in code, plus three you wire up
+once in the Astro console:
+
+**In code (already deployed):**
+- **`failure_analyst` DAG** — an LLM triages failures. Trigger it manually with
+  a conf like `{"dagName": "...", "message": "..."}`, or wire it to real
+  failures via the Astro alert below.
+- **`DeadlineAlert` on `deliver_advice`** — Airflow 3's code-native SLA (replaces
+  the removed `sla=`): if delivery doesn't finish within 2h of the run's logical
+  date, an async triggerer callback fires.
+
+**In the Astro console (one-time setup):**
+1. **Failure → AI triage.** Astro UI → **Alerts → Create** → type **Dag Failure**,
+   scope to `market_data_ingest`, `compute_indicators`, `trade_advisor`,
+   `deliver_advice` (NOT `failure_analyst` — it would retrigger itself) →
+   notification channel **Dag Trigger** → target this deployment + DAG
+   `failure_analyst` (Astro passes `dagName` / `airflowDagRunId` / `message`
+   into the run conf, which `failure_analyst` reads).
+2. **Delivery SLA.** Astro UI → **Alerts → Create** → **Dag Timeliness** on
+   `deliver_advice` with a verification time (e.g. advice delivered by 10:00 ET)
+   — Astro's managed equivalent of an SLA, no DAG code.
+3. **Astro Observe.** Observe → **Data Products → + Data Product** → select the
+   `stock_recommendations` outputs → add a **Freshness/Timeliness SLA**. Lineage
+   is auto-collected via OpenLineage (pre-installed on the runtime).
+
+Deployment metrics (DAG/task runs, durations, worker CPU/mem) are in the
+deployment's **Analytics** tab out of the box; export to Prometheus/Datadog via
+**Environment → Metrics Export** if desired.
 
 ## Local Development
 
