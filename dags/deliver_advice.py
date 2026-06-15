@@ -27,7 +27,15 @@ from datetime import timedelta
 import pendulum
 from airflow.exceptions import AirflowSkipException
 from airflow.providers.smtp.operators.smtp import EmailOperator
-from airflow.sdk import Asset, Variable, dag, task
+from airflow.sdk import (
+    Asset,
+    AsyncCallback,
+    DeadlineAlert,
+    DeadlineReference,
+    Variable,
+    dag,
+    task,
+)
 
 SNOWFLAKE_CONN_ID = "stock_signal_snowflake"
 SMTP_CONN_ID = "smtp_default"
@@ -183,6 +191,14 @@ def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
     """
 
 
+async def _sla_deadline_missed(*args, **kwargs) -> None:
+    # Runs on the triggerer (async) if the delivery deadline passes before this
+    # DAG finishes — Airflow 3's code-native SLA (Deadline Alerts) replacement
+    # for the removed `sla=` callback.
+    context = kwargs.get("context", {})
+    print(f"SLA DEADLINE MISSED — trade advice not delivered in time: {context}")
+
+
 @dag(
     dag_id="deliver_advice",
     start_date=pendulum.datetime(2025, 1, 1, tz="America/New_York"),
@@ -190,6 +206,13 @@ def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
     catchup=False,
     max_active_runs=1,
     default_args={"owner": "Astro", "retries": 2, "retry_delay": timedelta(minutes=2)},
+    # Code-native SLA (Airflow 3 Deadline Alerts): if delivery hasn't completed
+    # within 2h of the run's logical date, fire the callback on the triggerer.
+    deadline=DeadlineAlert(
+        reference=DeadlineReference.DAGRUN_LOGICAL_DATE,
+        interval=timedelta(hours=2),
+        callback=AsyncCallback(_sla_deadline_missed),
+    ),
     tags=["trade-advisor", "alerts", "onboarding"],
     doc_md=__doc__,
 )
