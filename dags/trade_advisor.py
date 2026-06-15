@@ -267,16 +267,18 @@ def trade_advisor():
                 sentiment_score FLOAT,
                 sentiment_summary STRING,
                 rationale STRING,
+                review_status STRING DEFAULT 'AUTO_CLEARED',
                 created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
             )
             """
         )
-        # Upgrade tables created before tiering/volatility existed.
+        # Upgrade tables created before tiering/volatility/review existed.
         hook.run(
             [
                 "ALTER TABLE stock_recommendations ADD COLUMN IF NOT EXISTS volatility_20 FLOAT",
                 "ALTER TABLE stock_recommendations ADD COLUMN IF NOT EXISTS tier STRING",
                 "ALTER TABLE stock_recommendations ADD COLUMN IF NOT EXISTS history_days NUMBER",
+                "ALTER TABLE stock_recommendations ADD COLUMN IF NOT EXISTS review_status STRING",
             ]
         )
 
@@ -545,6 +547,64 @@ def trade_advisor():
             f"{card['sentiment_score']:+.2f}: {card['sentiment_summary']}"
         )
 
+    @task.llm_branch(
+        llm_conn_id=LLM_CONN_ID,
+        system_prompt=(
+            "You are a risk officer reviewing a batch of daily trade "
+            "recommendations before the desk acts on them. Decide whether the "
+            "batch needs a human analyst's sign-off. Choose 'flag_for_review' "
+            "if any recommendation is high-conviction (a strong BUY or SELL) or "
+            "carries notable risk such as elevated volatility, a brand-new "
+            "listing, or signals that conflict with the news sentiment. Choose "
+            "'clear_for_delivery' only if everything is routine and "
+            "low-conviction (mostly HOLDs with unremarkable risk)."
+        ),
+    )
+    def route_review(ranked: list[dict]) -> str:
+        return (
+            "Assess whether this batch of recommendations needs analyst review "
+            "before distribution:\n\n" + json.dumps(ranked, indent=2)
+        )
+
+    @task
+    def flag_for_review() -> None:
+        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+        # High-conviction = an actionable BUY/SELL at a decisive score. Those
+        # rows go to the review queue; everything else in the batch is cleared.
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        hook.run(
+            """
+            UPDATE stock_recommendations
+            SET review_status = CASE
+                WHEN signal IN ('BUY', 'SELL') AND (score >= 70 OR score <= 35)
+                THEN 'PENDING_REVIEW' ELSE 'AUTO_CLEARED'
+            END
+            WHERE run_id = (
+                SELECT run_id FROM stock_recommendations
+                ORDER BY created_at DESC LIMIT 1
+            )
+            """
+        )
+        print("Routed batch through analyst review: high-conviction rows flagged PENDING_REVIEW")
+
+    @task
+    def clear_for_delivery() -> None:
+        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        hook.run(
+            """
+            UPDATE stock_recommendations
+            SET review_status = 'AUTO_CLEARED'
+            WHERE run_id = (
+                SELECT run_id FROM stock_recommendations
+                ORDER BY created_at DESC LIMIT 1
+            )
+            """
+        )
+        print("Batch cleared for delivery; no analyst review required")
+
     init = initialize_snowflake_tables()
     snapshot = fetch_indicator_snapshot()
     headlines = fetch_recent_headlines()
@@ -552,7 +612,8 @@ def trade_advisor():
     sentiment = score_news_sentiment(headlines)
     scorecards = compute_scorecards(snapshot, sentiment)
     rationales = generate_rationales(scorecards)
-    persist_recommendations(scorecards, rationales)
+    ranked = persist_recommendations(scorecards, rationales)
+    route_review(ranked) >> [flag_for_review(), clear_for_delivery()]
 
 
 trade_advisor()
