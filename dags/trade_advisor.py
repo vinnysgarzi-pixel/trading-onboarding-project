@@ -5,19 +5,21 @@ Asset-triggered DAG: runs when both `stock_indicators` (from the dbt layer)
 and `stock_news` (from ingest) have fresh data. For each tracked ticker it:
 
 1. Reads the latest two indicator rows from Snowflake.
-2. Has Claude score recent news headlines for sentiment (-1.0 to 1.0).
-3. Blends six signals into a 0-100 conviction score:
-   trend 25%, MACD 20%, RSI 15%, Bollinger 15%, volume 5%, sentiment 20%.
-4. Classifies BUY (>= 65), HOLD, or SELL (<= 40).
-5. Has Claude write a one-paragraph analyst rationale per ticker.
+2. Scores recent news headlines for sentiment via the Common AI provider's
+   `@task.llm` (structured output, -1.0 to 1.0).
+3. Blends tiered signals into a 0-100 conviction score (see TIER_CONFIG).
+4. Classifies BUY / HOLD / SELL per the ticker's tier thresholds.
+5. Writes a one-paragraph analyst rationale per ticker, again via `@task.llm`.
 6. Writes the batch to `stock_recommendations` and emits its Asset.
 
-If the Anthropic connection is not configured, the DAG still runs: sentiment
-defaults to neutral and rationales fall back to a templated summary.
+The LLM tasks call the Apache Airflow **Common AI provider** (pydantic-ai under
+the hood), configured entirely through a connection — no model SDK is imported
+here. The connection points at Astronomer's LLM gateway.
 
 Required Airflow configuration:
 - Snowflake connection: `stock_signal_snowflake`
-- Optional connection: `anthropic_default` (password = Anthropic API key)
+- LLM connection: `pydanticai_default` (conn_type `pydanticai`; host = gateway
+  base URL; password = Astro API token; extra `{"model": "anthropic:claude-opus-4-8"}`)
 
 This is a demo signal pipeline, not investment advice.
 """
@@ -28,17 +30,82 @@ import json
 from datetime import timedelta
 
 import pendulum
-from airflow.sdk import Asset, BaseHook, dag, task
+from pydantic import BaseModel
+
+from airflow.providers.common.compat.sdk import dag, task
+from airflow.sdk import Asset
 
 SNOWFLAKE_CONN_ID = "stock_signal_snowflake"
-ANTHROPIC_CONN_ID = "anthropic_default"
-CLAUDE_MODEL = "claude-opus-4-8"
+LLM_CONN_ID = "pydanticai_default"
 NEWS_LOOKBACK_DAYS = 5
 MAX_HEADLINES_PER_SYMBOL = 8
 
 STOCK_INDICATORS_ASSET = Asset(name="stock_indicators")
 STOCK_NEWS_ASSET = Asset(name="stock_news")
 RECOMMENDATIONS_ASSET = Asset(name="stock_recommendations")
+
+RATIONALE_SYSTEM_PROMPT = (
+    "You are a buy-side equity analyst writing brief daily notes. For each "
+    "ticker scorecard, write a 2-3 sentence rationale explaining the signal in "
+    "plain language, citing the most decisive indicators by name and value. "
+    "Match the tone of a morning desk note. Do not hedge with generic "
+    "disclaimers. When a ticker's tier is 'new_ipo' or 'developing', open by "
+    "noting it is a recently listed stock evaluated on limited history, with "
+    "news sentiment and volatility weighted more heavily."
+)
+
+
+# Structured-output models for the @task.llm calls. Defined at module scope so
+# their qualified names survive XCom serialization and re-import downstream.
+class SymbolSentiment(BaseModel):
+    symbol: str
+    sentiment_score: float  # -1.0 (very bearish) .. 1.0 (very bullish)
+    summary: str
+
+
+class SentimentBatch(BaseModel):
+    results: list[SymbolSentiment]
+
+
+class SymbolRationale(BaseModel):
+    symbol: str
+    rationale: str
+
+
+class RationaleBatch(BaseModel):
+    results: list[SymbolRationale]
+
+
+def _as_dict(item) -> dict:
+    """Normalize an LLM result item that may be a pydantic model or a dict."""
+    return item if isinstance(item, dict) else item.model_dump()
+
+
+def _results_of(batch) -> list:
+    """Pull the `results` list off a batch that may be a model or a dict."""
+    if hasattr(batch, "results"):
+        return batch.results
+    if isinstance(batch, dict):
+        return batch.get("results", [])
+    return []
+
+
+def _sentiment_to_dict(batch) -> dict[str, dict]:
+    sentiment: dict[str, dict] = {}
+    for item in _results_of(batch):
+        record = _as_dict(item)
+        sentiment[record["symbol"]] = {
+            "sentiment_score": max(-1.0, min(1.0, float(record["sentiment_score"]))),
+            "summary": record["summary"],
+        }
+    return sentiment
+
+
+def _rationales_to_dict(batch) -> dict[str, str]:
+    return {
+        _as_dict(item)["symbol"]: _as_dict(item)["rationale"]
+        for item in _results_of(batch)
+    }
 
 # Evaluation tiers keyed by available trading history. Young listings can't
 # support long-window indicators, so scoring shifts weight toward news
@@ -83,41 +150,6 @@ def _tier_for(history_days: float) -> str:
         if history_days >= TIER_CONFIG[tier_name]["min_history"]:
             return tier_name
     return "new_ipo"
-
-
-def _get_anthropic_client():
-    """Return an Anthropic client, or None when no API key is configured.
-
-    Two connection shapes are supported:
-    - password only: a regular Anthropic API key against api.anthropic.com
-    - host + password: an Anthropic-compatible gateway (e.g. Astronomer's
-      LLM gateway) where the password is a bearer token, not an API key
-    """
-    try:
-        conn = BaseHook.get_connection(ANTHROPIC_CONN_ID)
-    except Exception:
-        return None
-    if not conn.password:
-        return None
-
-    import anthropic
-
-    if conn.host:
-        return anthropic.Anthropic(base_url=conn.host, auth_token=conn.password)
-    return anthropic.Anthropic(api_key=conn.password)
-
-
-def _claude_json(client, system: str, user_content: str, schema: dict) -> dict:
-    """Single structured-output Messages API call; returns the parsed object."""
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=4000,
-        system=system,
-        messages=[{"role": "user", "content": user_content}],
-        output_config={"format": {"type": "json_schema", "schema": schema}},
-    )
-    text = next(block.text for block in response.content if block.type == "text")
-    return json.loads(text)
 
 
 def _score_trend(latest: dict) -> tuple[float, str]:
@@ -321,94 +353,30 @@ def trade_advisor():
             headlines.setdefault(symbol, []).append(headline)
         return headlines
 
-    @task
-    def score_news_sentiment(headlines_by_symbol: dict[str, list[str]]) -> dict[str, dict]:
-        neutral = {
-            symbol: {
-                "sentiment_score": 0.0,
-                "summary": "No recent headlines; sentiment treated as neutral.",
-            }
-            for symbol in headlines_by_symbol
-        }
-        symbols_with_news = {s: h for s, h in headlines_by_symbol.items() if h}
-        if not symbols_with_news:
-            return neutral
-
-        client = _get_anthropic_client()
-        if client is None:
-            print(
-                f"Connection {ANTHROPIC_CONN_ID} not configured; "
-                "using neutral sentiment for all symbols"
-            )
-            for symbol in symbols_with_news:
-                neutral[symbol]["summary"] = (
-                    "Sentiment model not configured; treated as neutral."
-                )
-            return neutral
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "results": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "symbol": {"type": "string"},
-                            "sentiment_score": {
-                                "type": "number",
-                                "description": "Between -1.0 (very bearish) and 1.0 (very bullish)",
-                            },
-                            "summary": {
-                                "type": "string",
-                                "description": "One sentence summarizing the news tone",
-                            },
-                        },
-                        "required": ["symbol", "sentiment_score", "summary"],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            "required": ["results"],
-            "additionalProperties": False,
-        }
-
-        parsed = _claude_json(
-            client,
-            system=(
-                "You are a financial news sentiment analyst. For each stock "
-                "symbol, read its recent headlines and produce a sentiment_score "
-                "between -1.0 (very bearish) and 1.0 (very bullish), plus a "
-                "one-sentence summary of the news tone. Score 0.0 when the "
-                "headlines are mixed or immaterial."
-            ),
-            user_content=(
-                "Score the news sentiment for each symbol:\n\n"
-                + json.dumps(symbols_with_news, indent=2)
-            ),
-            schema=schema,
+    @task.llm(
+        llm_conn_id=LLM_CONN_ID,
+        system_prompt=(
+            "You are a financial news sentiment analyst. You are given recent "
+            "headlines per stock symbol. Return exactly one result per symbol "
+            "with a sentiment_score between -1.0 (very bearish) and 1.0 (very "
+            "bullish) and a one-sentence summary of the news tone. Score 0.0 "
+            "when the headlines are mixed, immaterial, or empty."
+        ),
+        output_type=SentimentBatch,
+    )
+    def score_news_sentiment(headlines_by_symbol: dict[str, list[str]]) -> str:
+        return (
+            "Score the news sentiment for each symbol below. Include every "
+            "symbol in your response, even those with an empty headline list "
+            "(score those 0.0).\n\n" + json.dumps(headlines_by_symbol, indent=2)
         )
 
-        sentiment = dict(neutral)
-        for result in parsed["results"]:
-            symbol = result["symbol"]
-            if symbol in sentiment:
-                sentiment[symbol] = {
-                    "sentiment_score": max(-1.0, min(1.0, float(result["sentiment_score"]))),
-                    "summary": result["summary"],
-                }
-        print(f"Claude sentiment: { {s: v['sentiment_score'] for s, v in sentiment.items()} }")
-        return sentiment
-
-    @task(outlets=[RECOMMENDATIONS_ASSET])
-    def compose_recommendations(
+    @task
+    def compute_scorecards(
         snapshot: dict[str, list[dict]],
-        sentiment: dict[str, dict],
-        **context,
+        sentiment_batch,
     ) -> list[dict]:
-        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-
-        run_id = context["run_id"]
+        sentiment = _sentiment_to_dict(sentiment_batch)
         scorecards = []
         for symbol, rows in sorted(snapshot.items()):
             latest = rows[0]
@@ -475,15 +443,43 @@ def trade_advisor():
                 }
             )
 
+        print(f"Computed {len(scorecards)} scorecards")
+        return scorecards
+
+    @task.llm(
+        llm_conn_id=LLM_CONN_ID,
+        system_prompt=RATIONALE_SYSTEM_PROMPT,
+        output_type=RationaleBatch,
+    )
+    def generate_rationales(scorecards: list[dict]) -> str:
+        return (
+            "Write a 2-3 sentence analyst rationale for each ticker scorecard "
+            "below. The composite score is 0-100; each card lists its evaluation "
+            "tier, the exact weights_used, its BUY/SELL thresholds, and per-signal "
+            "subscores. Newer listings (tier 'developing' or 'new_ipo') lack "
+            "long-window indicators, so open their note by flagging the limited "
+            "history and the heavier weight on sentiment and volatility.\n\n"
+            + json.dumps(scorecards, indent=2)
+        )
+
+    @task(outlets=[RECOMMENDATIONS_ASSET])
+    def persist_recommendations(
+        scorecards: list[dict],
+        rationale_batch,
+        **context,
+    ) -> list[dict]:
+        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+        run_id = context["run_id"]
         if not scorecards:
             print("No tickers had a complete indicator snapshot; nothing to recommend")
             return []
 
-        rationales = _generate_rationales(scorecards)
+        rationales = _rationales_to_dict(rationale_batch)
         for card in scorecards:
             card["rationale"] = rationales.get(card["symbol"]) or _template_rationale(card)
             for transient in ("subscores", "weights_used", "thresholds"):
-                card.pop(transient)
+                card.pop(transient, None)
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         with hook.get_conn() as conn:
@@ -531,65 +527,6 @@ def trade_advisor():
         )
         return ranked
 
-    def _generate_rationales(scorecards: list[dict]) -> dict[str, str]:
-        client = _get_anthropic_client()
-        if client is None:
-            return {}
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "results": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "symbol": {"type": "string"},
-                            "rationale": {
-                                "type": "string",
-                                "description": "2-3 sentence analyst note",
-                            },
-                        },
-                        "required": ["symbol", "rationale"],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            "required": ["results"],
-            "additionalProperties": False,
-        }
-
-        try:
-            parsed = _claude_json(
-                client,
-                system=(
-                    "You are a buy-side equity analyst writing brief daily notes. "
-                    "For each ticker scorecard, write a 2-3 sentence rationale "
-                    "explaining the signal in plain language, citing the most "
-                    "decisive indicators by name and value. Match the tone of a "
-                    "morning desk note. Do not hedge with generic disclaimers. "
-                    "When a ticker's tier is 'new_ipo' or 'developing', open by "
-                    "noting it is a recently listed stock evaluated on limited "
-                    "history, with news sentiment and volatility weighted more "
-                    "heavily."
-                ),
-                user_content=(
-                    "Write a rationale for each ticker. The composite score is "
-                    "0-100. Each scorecard includes its evaluation tier, the "
-                    "exact weights_used, its BUY/SELL thresholds, and the "
-                    "subscores per signal — newer listings lack long-window "
-                    "indicators, so their weights lean on sentiment, "
-                    "short-window momentum, and volatility risk."
-                    "\n\n" + json.dumps(scorecards, indent=2)
-                ),
-                schema=schema,
-            )
-        except Exception as error:
-            print(f"Claude rationale generation failed; using templates: {error}")
-            return {}
-
-        return {result["symbol"]: result["rationale"] for result in parsed["results"]}
-
     def _template_rationale(card: dict) -> str:
         prefix = ""
         if card["tier"] != "full":
@@ -612,7 +549,10 @@ def trade_advisor():
     snapshot = fetch_indicator_snapshot()
     headlines = fetch_recent_headlines()
     init >> [snapshot, headlines]
-    compose_recommendations(snapshot, score_news_sentiment(headlines))
+    sentiment = score_news_sentiment(headlines)
+    scorecards = compute_scorecards(snapshot, sentiment)
+    rationales = generate_rationales(scorecards)
+    persist_recommendations(scorecards, rationales)
 
 
 trade_advisor()

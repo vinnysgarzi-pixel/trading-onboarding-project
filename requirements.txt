@@ -2,5 +2,7 @@
 
 apache-airflow-providers-snowflake>=6.12.1,<7
 astronomer-cosmos>=1.10,<2
-anthropic>=0.69
 apache-airflow-providers-smtp
+# Common AI provider (experimental, pinned) — powers the @task.llm / @task.agent
+# / @task.llm_branch operators against the Astro LLM gateway via a pydanticai conn.
+apache-airflow-providers-common-ai[anthropic]>=0.1,<1
