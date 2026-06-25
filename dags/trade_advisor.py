@@ -19,7 +19,7 @@ here. The connection points at Astronomer's LLM gateway.
 Required Airflow configuration:
 - Snowflake connection: `stock_signal_snowflake`
 - LLM connection: `pydanticai_default` (conn_type `pydanticai`; host = gateway
-  base URL; password = Astro API token; extra `{"model": "anthropic:claude-opus-4-8"}`)
+  base URL; password = Astro API token; extra `{"model": "anthropic:claude-haiku-4-5"}`)
 
 This is a demo signal pipeline, not investment advice.
 """

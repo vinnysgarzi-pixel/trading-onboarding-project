@@ -2,21 +2,16 @@
 # Deliver Advice
 
 Asset-triggered DAG: runs whenever the trade advisor writes a new batch to
-`stock_recommendations`. Delivers the ranked leaderboard through two
-independent channels, each skipping gracefully when unconfigured:
+`stock_recommendations`. Delivers the ranked leaderboard to the task logs, and
+optionally to a Slack-compatible webhook when one is configured:
 
 - Slack-compatible webhook (Variable `stock_alert_webhook_url`)
-- HTML email (connection `smtp_default` + Variable
-  `stock_alert_email_recipients`, comma-separated addresses)
 
 The plain-text leaderboard is always written to task logs.
 
 Required Airflow configuration:
 - Snowflake connection: `stock_signal_snowflake`
-- Optional connection: `smtp_default` (host/port/login/password; Extra JSON
-  may set `from_email`)
 - Optional Variable: `stock_alert_webhook_url`
-- Optional Variable: `stock_alert_email_recipients`
 """
 
 from __future__ import annotations
@@ -25,8 +20,6 @@ import json
 from datetime import timedelta
 
 import pendulum
-from airflow.exceptions import AirflowSkipException
-from airflow.providers.smtp.operators.smtp import EmailOperator
 from airflow.sdk import (
     Asset,
     AsyncCallback,
@@ -38,12 +31,9 @@ from airflow.sdk import (
 )
 
 SNOWFLAKE_CONN_ID = "stock_signal_snowflake"
-SMTP_CONN_ID = "smtp_default"
 RECOMMENDATIONS_ASSET = Asset(name="stock_recommendations")
 
 SIGNAL_EMOJI = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
-SIGNAL_COLOR = {"BUY": "#16a34a", "SELL": "#dc2626", "HOLD": "#6b7280"}
-SCORE_COLOR = {"BUY": "#dcfce7", "SELL": "#fee2e2", "HOLD": "#f3f4f6"}
 
 
 def _format_text_leaderboard(rows: list[dict], issues: list[dict]) -> str:
@@ -69,126 +59,6 @@ def _format_text_leaderboard(rows: list[dict], issues: list[dict]) -> str:
         lines.append(f"⚠️ *Data issues this run:*\n{issue_lines}")
     lines.append("_Demo signal pipeline on Astro — not investment advice._")
     return "\n\n".join(lines)
-
-
-def _format_issues_card(issues: list[dict]) -> str:
-    if not issues:
-        return ""
-    items = "".join(
-        f"""<div style="padding-top:4px;">
-              <strong>{issue["symbol"]}</strong> ({issue["stage"]}): {issue["error"]}
-            </div>"""
-        for issue in issues
-    )
-    return f"""
-        <tr>
-          <td style="padding:14px 16px;background:#fef3c7;border:1px solid #f59e0b;
-                     border-radius:10px;font-family:Helvetica,Arial,sans-serif;
-                     font-size:13px;color:#92400e;line-height:1.5;">
-            <strong>⚠️ Data issues this run</strong> — these tickers could not be
-            refreshed and are missing or stale below:
-            {items}
-          </td>
-        </tr>
-        <tr><td style="height:10px;"></td></tr>
-    """
-
-
-def _tier_badge_html(row: dict) -> str:
-    tier = row.get("tier") or "full"
-    if tier == "full":
-        return ""
-    days = int(row["history_days"]) if row.get("history_days") else 0
-    if tier == "new_ipo":
-        label, bg, fg = f"🆕 NEW LISTING · {days} trading days", "#ede9fe", "#6d28d9"
-    else:
-        label, bg, fg = f"⏳ {days} days of history — no SMA-200 yet", "#dbeafe", "#1d4ed8"
-    return (
-        f'&nbsp;<span style="background:{bg};color:{fg};border-radius:12px;'
-        'padding:2px 10px;font-size:11px;font-weight:600;white-space:nowrap;">'
-        f"{label}</span>"
-    )
-
-
-def _format_html_email(rows: list[dict], issues: list[dict]) -> str:
-    cards = []
-    for rank, row in enumerate(rows, 1):
-        signal = row["signal"]
-        badge = (
-            f'<span style="background:{SIGNAL_COLOR[signal]};color:#ffffff;'
-            'border-radius:12px;padding:2px 12px;font-size:13px;font-weight:600;">'
-            f"{signal}</span>"
-        )
-        badge += _tier_badge_html(row)
-        cards.append(
-            f"""
-            <tr>
-              <td style="padding:14px 16px;background:{SCORE_COLOR[signal]};
-                         border-radius:10px;border:1px solid #e5e7eb;">
-                <table width="100%" cellpadding="0" cellspacing="0" style="font-family:Helvetica,Arial,sans-serif;">
-                  <tr>
-                    <td style="font-size:17px;font-weight:700;color:#111827;">
-                      {rank}. {row["symbol"]} &nbsp;{badge}
-                    </td>
-                    <td align="right" style="font-size:15px;color:#111827;">
-                      <strong>{row["score"]:.0f}</strong><span style="color:#6b7280;">/100</span>
-                      &nbsp;·&nbsp; ${row["close"]:.2f}
-                    </td>
-                  </tr>
-                  <tr>
-                    <td colspan="2" style="padding-top:6px;font-size:13px;color:#374151;line-height:1.5;">
-                      {row["rationale"]}
-                    </td>
-                  </tr>
-                  <tr>
-                    <td colspan="2" style="padding-top:6px;font-size:12px;color:#6b7280;">
-                      RSI {row["rsi_14"]:.0f} · MACD hist {row["macd_histogram"]:.2f} ·
-                      Bollinger z {row["bollinger_z"]:.2f} · Volume {row["volume_ratio"]:.2f}× ·
-                      Volatility {row["volatility_20"]:.0f}% ·
-                      News sentiment {row["sentiment_score"]:+.2f}
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-            <tr><td style="height:10px;"></td></tr>
-            """
-        )
-
-    return f"""
-    <html>
-      <body style="margin:0;padding:24px;background:#f9fafb;">
-        <table width="100%" cellpadding="0" cellspacing="0">
-          <tr><td align="center">
-            <table width="560" cellpadding="0" cellspacing="0"
-                   style="font-family:Helvetica,Arial,sans-serif;">
-              <tr>
-                <td style="padding-bottom:4px;font-size:22px;font-weight:800;color:#111827;">
-                  📈 Trade Advisor
-                </td>
-              </tr>
-              <tr>
-                <td style="padding-bottom:18px;font-size:13px;color:#6b7280;">
-                  Signals as of {rows[0]["price_date"]} · powered by Apache Airflow on Astro
-                </td>
-              </tr>
-              {"".join(cards)}
-              {_format_issues_card(issues)}
-              <tr>
-                <td style="padding-top:12px;font-size:11px;color:#9ca3af;">
-                  Composite score blends trend, MACD, RSI, Bollinger, volume,
-                  volatility, and AI-scored news sentiment, weighted by each
-                  ticker's history tier — newer listings lean on sentiment and
-                  volatility and need more conviction to leave HOLD (BUY ≥ 70
-                  vs 65). Demo signal pipeline — not investment advice.
-                </td>
-              </tr>
-            </table>
-          </td></tr>
-        </table>
-      </body>
-    </html>
-    """
 
 
 async def _sla_deadline_missed(*args, **kwargs) -> None:
@@ -311,53 +181,8 @@ def deliver_advice():
 
         print(message)
 
-    @task
-    def render_email(batch: dict) -> dict:
-        from airflow.sdk import BaseHook
-
-        rows, issues = batch["recommendations"], batch["issues"]
-        if not rows:
-            raise AirflowSkipException("No recommendations to email")
-
-        recipients = Variable.get("stock_alert_email_recipients", default=None)
-        if not recipients:
-            raise AirflowSkipException(
-                "Variable stock_alert_email_recipients not set; skipping email"
-            )
-
-        try:
-            BaseHook.get_connection(SMTP_CONN_ID)
-        except Exception:
-            raise AirflowSkipException(
-                f"Connection {SMTP_CONN_ID} not configured; skipping email"
-            )
-
-        top = rows[0]
-        subject = (
-            f"📈 Trade Advisor {top['price_date']}: "
-            f"{top['symbol']} {top['signal']} ({top['score']:.0f}/100)"
-        )
-        if issues:
-            subject += f" — ⚠️ {len(issues)} data issue(s)"
-        return {
-            "to": [address.strip() for address in recipients.split(",")],
-            "subject": subject,
-            "html": _format_html_email(rows, issues),
-        }
-
     batch = fetch_latest_batch()
     send_webhook(batch)
-    email_payload = render_email(batch)
-
-    # The sender address comes from the smtp_default connection's
-    # Extra JSON `from_email`; skips cascade from render_email.
-    EmailOperator(
-        task_id="send_email",
-        conn_id=SMTP_CONN_ID,
-        to=email_payload["to"],
-        subject=email_payload["subject"],
-        html_content=email_payload["html"],
-    )
 
 
 deliver_advice()

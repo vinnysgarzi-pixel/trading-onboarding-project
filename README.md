@@ -5,8 +5,9 @@ computes technical indicators with dbt (via Astronomer Cosmos), and uses the
 **Apache Airflow Common AI provider** (`@task.llm`, `@task.llm_branch`) to score
 news sentiment, write analyst rationales, and route high-conviction calls
 through a **human-in-the-loop** approval gate — delivering a ranked
-BUY/HOLD/SELL leaderboard by email. A separate LLM-powered `failure_analyst`
-DAG triages pipeline failures, showcasing AI-driven observability on Astro.
+BUY/HOLD/SELL leaderboard to the task logs (and an optional Slack-compatible
+webhook). A separate LLM-powered `failure_analyst` DAG triages pipeline
+failures, showcasing AI-driven observability on Astro.
 
 The LLM operators run against **Astronomer's LLM gateway** through a
 `pydanticai` connection — no model SDK or API key in the DAG code.
@@ -56,12 +57,12 @@ trade_advisor   (Common AI provider operators)
           │                                    │
           ▼ (asset-triggered)                  ▼ (flags high-conviction rows PENDING_REVIEW)
 deliver_advice                          trade_review   (on-demand, HITL)
-  └── send_webhook + EmailOperator        ├── fetch_pending_review
-     (+ code-native DeadlineAlert SLA)     ├── analyst_decision  HITLBranchOperator (Approve/Reject)
-                                           └── mark_approved | mark_rejected
+  └── send_webhook (logs + optional       ├── fetch_pending_review
+      Slack webhook)                       ├── analyst_decision  HITLBranchOperator (Approve/Reject)
+     (+ code-native DeadlineAlert SLA)     └── mark_approved | mark_rejected
 
 failure_analyst   (on-demand / Astro Dag-Failure alert via Dag Trigger)
-  └── extract_context → diagnose @task.llm (severity + root cause) → email on-call
+  └── gather_incidents → diagnose @task.llm (severity + root cause) → log_diagnoses
 ```
 
 ### Composite score — tiered by available history
@@ -80,7 +81,7 @@ an evaluation tier per ticker from its trading history:
 
 Tickers with under ~20 trading days are skipped with a note in the delivery
 (they join automatically once they have enough history). Non-full-tier
-tickers are badged in the email (🆕 NEW LISTING / ⏳ limited history). A
+tickers are badged in the leaderboard (🆕 NEW LISTING / ⏳ limited history). A
 ranking is produced on every run, so the demo always has fresh output.
 
 ### Snowflake tables
@@ -97,9 +98,9 @@ ranking is produced on every run, so the demo always has fresh output.
 The `trade_advisor` LLM tasks require the `pydanticai_default` connection. The
 `trade_review` (HITL) DAG is on-demand — an analyst triggers it to approve the
 high-conviction signals the LLM branch flagged (`review_status = PENDING_REVIEW`),
-recording the decision back to `stock_recommendations`. Delivery is optional:
-without `smtp_default` / recipients the email step skips, and the leaderboard
-always lands in task logs.
+recording the decision back to `stock_recommendations`. The leaderboard always
+lands in task logs; set `stock_alert_webhook_url` to also push it to a
+Slack-compatible webhook.
 
 ## Required Airflow Connections
 
@@ -127,23 +128,16 @@ unfunded paper accounts.
 ### `pydanticai_default` (Common AI provider)
 
 Powers the `@task.llm` / `@task.llm_branch` operators (model
-`anthropic:claude-opus-4-8`).
+`anthropic:claude-haiku-4-5`).
 
 - Conn type: `pydanticai`
 - Host: LLM gateway base URL
   (`https://api.astronomer.io/v1alpha1/organizations/<org_id>/llm`)
 - Password: Astro API token (the gateway accepts it as `x-api-key`)
-- Extra JSON: `{"model": "anthropic:claude-opus-4-8"}`
+- Extra JSON: `{"model": "anthropic:claude-haiku-4-5"}`
 
 Model and endpoint live entirely on the connection — the DAGs never import a
 model SDK. (The older `anthropic_default` connection is no longer used.)
-
-### `smtp_default` (SMTP, optional)
-
-Enables the HTML email report from `deliver_advice` (sent with the SMTP
-provider's `EmailOperator`). Host/port/login/password of any SMTP server
-(e.g. `smtp.gmail.com:587` with an app password), and set the sender in
-Extra JSON: `{"from_email": "you@example.com"}`.
 
 ## Optional Airflow Variables
 
@@ -151,7 +145,6 @@ Extra JSON: `{"from_email": "you@example.com"}`.
 |---|---|---|
 | `tracked_stock_tickers` | JSON array, e.g. `["AAPL", "MSFT", "NVDA"]` | `["AAPL", "MSFT", "NVDA"]` |
 | `stock_alert_webhook_url` | Slack-compatible webhook for the leaderboard | logs only |
-| `stock_alert_email_recipients` | Comma-separated email recipients | email skipped |
 
 Edit `tracked_stock_tickers` in the Astro UI (**Environment → Airflow Variables**)
 to add/remove tickers — no redeploy needed; the next run picks it up. Keep the
